@@ -1,80 +1,111 @@
-import sys, os, zlib
-from struct import unpack
+#!/usr/bin/env python3
+import sys
+import os
+import zlib
+import struct
 
-# https://www.akeebabackup.com/documentation/akeeba-backup-documentation/appendices.html
+def main():
+    if len(sys.argv) < 2:
+        raise Exception("Usage: {} <akeeba-archive> [extract-path]".format(sys.argv[0]))
+    
+    archive_path = sys.argv[1]
+    target = sys.argv[2] if len(sys.argv) > 2 else '.'
 
-if len(sys.argv) < 2:
-	raise Exception('Usage %s <akeeba-archive> [extract-path]' % sys.argv[0])
+    # Open the archive in binary mode.
+    with open(archive_path, 'rb') as archive:
+        # The first three bytes should be the magic b'JPA'
+        magic = archive.read(3)
+        if magic != b'JPA':
+            raise Exception("This does not seem to be an Akeeba Backup archive")
 
-archive = open(sys.argv[1], 'rb')
-magic = archive.read(3)
+        # Read header information.
+        header_size, = struct.unpack('<H', archive.read(2))
+        vmaj, vmin = struct.unpack('<BB', archive.read(2))
+        print("JPA Version: {}.{}".format(vmaj, vmin))
 
-if len(sys.argv) > 2:
-	target = sys.argv[2]
-else:
-	target = '.'
+        entitycount, = struct.unpack('<L', archive.read(4))
+        print("Entities: {}".format(entitycount))
 
-if magic != 'JPA':
-	raise Exception('This does not seem to be an Akeeba Backup archive')
+        usize, csize = struct.unpack('<LL', archive.read(8))
+        print("Uncompressed size: {} bytes, compressed: {} bytes".format(usize, csize))
 
-header_size, = unpack('<H', archive.read(2))
-vmaj, vmin = unpack('<BB', archive.read(2))
-print('JPA Version: %d.%d' % (vmaj, vmin))
+        # Check for span marker.
+        span_or_file = archive.read(3)
+        if span_or_file == b'JP\x01':
+            # Consume extra magic and fixed header size.
+            archive.read(1 + 2)
+            spans, = struct.unpack('<H', archive.read(2))
+            print("Spans: {}".format(spans))
+            if spans > 1:
+                raise NotImplementedError("Span support is absent")
+            span_or_file = archive.read(3)
+        print()
 
-entitycount, = unpack('<L', archive.read(4))
-print('Entities: %d' % entitycount)
+        # Use the filesystem encoding for file names.
+        fs_encoding = sys.getfilesystemencoding()
 
-usize, csize = unpack('<LL', archive.read(8))
-print('Uncompressed size: %d bytes, compressed: %d bytes' % (usize, csize))
+        # Process all entities.
+        while span_or_file:
+            if span_or_file != b'JPF':
+                raise Exception("Invalid file header magic: {}".format(span_or_file))
 
-span_or_file = archive.read(3)
-if span_or_file == 'JP\1':
-	archive.read(1 + 2) # Consume 4th magic and fixed header size
-	spans, = unpack('<H', archive.read(2))
-	print('Spans: %d' % spans)
-	if spans > 1:
-		raise NotImplementedError('Span support is absent')
-	span_or_file = archive.read(3)
+            header_size, = struct.unpack('<H', archive.read(2))
+            path_len, = struct.unpack('<H', archive.read(2))
+            path_bytes = archive.read(path_len)
+            try:
+                # Decode the path using the filesystem encoding.
+                path = path_bytes.decode(fs_encoding)
+            except UnicodeDecodeError:
+                path = path_bytes.decode(fs_encoding, errors='replace')
 
-print
+            type_index = struct.unpack('<B', archive.read(1))[0]
+            entity_types = ['dir', 'file', 'link']
+            try:
+                entity_type = entity_types[type_index]
+            except IndexError:
+                raise Exception("Unknown entity type code: {}".format(type_index))
 
-while span_or_file != '': # EOF
-	if span_or_file != 'JPF':
-		raise Exception('Invalid file header magic')
+            comp_index = struct.unpack('<B', archive.read(1))[0]
+            compressions = ['none', 'gzip', 'bzip2']
+            try:
+                compression = compressions[comp_index]
+            except IndexError:
+                raise Exception("Unknown compression type code: {}".format(comp_index))
 
-	header_size, = unpack('<H', archive.read(2))
-	path_len, = unpack('<H', archive.read(2))
-	path = archive.read(path_len)
-	_type = ['dir', 'file', 'link'][unpack('<B', archive.read(1))[0]]
-	compression = ['none', 'gzip', 'bzip2'][unpack('<B', archive.read(1))[0]]
+            csize, usize, chmod = struct.unpack('<LLL', archive.read(12))
 
-	csize, usize, chmod = unpack('<LLL', archive.read(12))
+            print("{} [{}] (compression: {}) {} bytes {:o}".format(path, entity_type, compression, usize, chmod))
 
-	print('%s [%s] (compression: %s) %d bytes %o' % (path, _type, compression, usize, chmod))
+            # Check for extra header data.
+            expected_header_size = 3 + 2 + 2 + path_len + 1 + 1 + 12
+            if header_size > expected_header_size:
+                extra, elen = struct.unpack('<HH', archive.read(4))
+                if extra != 256:
+                    print(extra)
+                    raise Exception("Unknown extra field")
+                archive.read(4)  # Consume timestamp
 
-	if header_size > (3 + 2 + 2 + path_len + 1 + 1 + 12):
-		extra, elen = unpack('<HH', archive.read(4))
-		if extra != 256:
-			print extra
-			raise Exception('Unkown extra field')
-		archive.read(4) # Timestamp
+            if entity_type == 'file':
+                out_path = os.path.join(target, path)
+                os.makedirs(os.path.dirname(out_path), exist_ok=True)
+                data = archive.read(csize)
+                if compression == 'gzip':
+                    file_data = zlib.decompress(data, -15)
+                elif compression == 'none':
+                    file_data = data
+                else:
+                    raise NotImplementedError("Unknown compression: " + compression)
+                with open(out_path, 'wb') as outfile:
+                    outfile.write(file_data)
+            elif entity_type == 'dir':
+                out_path = os.path.join(target, path)
+                os.makedirs(out_path, exist_ok=True)
+            else:
+                raise NotImplementedError("Unknown entity type: " + entity_type)
 
-	if _type == 'file':
-		to = os.path.join(target, path)
-		if not os.path.exists(os.path.dirname(to)):
-			os.makedirs(os.path.dirname(to))
-		data = archive.read(csize) # todo: memory
-		if compression == 'gzip':
-			open(to, 'wb').write(zlib.decompress(data, -15))
-		elif compression == 'none':
-			open(to, 'wb').write(data)
-		else:
-			raise NotImplementedError('Unkown compression')
-	elif _type == 'dir':
-		to = os.path.join(target, path)
-		if not os.path.exists(to):
-			os.makedirs(to)
-	else:
-		raise NotImplementedError('Unkown entity type')
+            # Read the next 3-byte header magic (or empty if at EOF)
+            span_or_file = archive.read(3)
 
-	span_or_file = archive.read(3)
+if __name__ == '__main__':
+    main()
+
